@@ -1,19 +1,20 @@
-from fastapi import WebSocket, status, Query
-from typing import Optional
+from fastapi import WebSocket, HTTPException
 from ..redis.config import Redis
 
-async def get_token(
-    websocket: WebSocket,
-    token: Optional[str] = Query(None),
-):
+redis = Redis()
+
+async def get_token(websocket: WebSocket):
+    query_params = dict(websocket.query_params)
+    token = query_params.get('token')
     
-    if token is None or token == "":
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-
-    redis_client = await Redis.create_connection()
-    doesExist = await redis_client.exists(token)
-
-    if doesExist == 1:
-        return token
-    else:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Session not authenticated or expired token")
+    if not token:
+        raise HTTPException(status_code=400, detail="Token is required")
+    
+    # Validate token with Redis
+    redis_client = await redis.create_connection()
+    exists = await redis_client.exists(token)
+    
+    if not exists:
+        raise HTTPException(status_code=403, detail="Invalid or expired token")
+    
+    return token

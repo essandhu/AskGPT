@@ -1,15 +1,13 @@
 import os
-from fastapi import APIRouter, FastAPI, WebSocket,  Request, BackgroundTasks, HTTPException, WebSocketDisconnect, Depends
-import uuid 
+from fastapi import APIRouter, WebSocket, Request, BackgroundTasks, HTTPException, WebSocketDisconnect, Depends
+import uuid
+import json  # New import for JSON handling
 from ..socket.connection import ConnectionManager
 from ..socket.utils import get_token
 from ..redis.producer import Producer
 from ..redis.config import Redis
-from rejson import Path
 from ..schema.chat import Chat
-import time
 from ..redis.stream import StreamConsumer
-from ..redis.cache import Cache
 
 chat = APIRouter()
 manager = ConnectionManager()
@@ -20,49 +18,52 @@ redis = Redis()
 # @access  Public
 @chat.post("/token")
 async def token_generator(name: str, request: Request):
-    if name == "":
+    if not name:
         raise HTTPException(status_code=400, detail={
             "loc": "name",  "msg": "Enter a valid name"})
-    token = str(uuid.uuid4())
-    # Create new chat session
-    json_client = redis.create_rejson_connection()
 
+    token = str(uuid.uuid4())
+
+    # Create new chat session
     chat_session = Chat(
         token=token,
         messages=[],
         name=name
     )
 
-    # Store chat session in redis JSON with the token as key
-    json_client.jsonset(str(token), Path.rootPath(), chat_session.dict())
-
-    # Set a timeout for redis data (1 hour)
+    # Store chat session in Redis as a JSON string
     redis_client = await redis.create_connection()
+    await redis_client.set(str(token), json.dumps(chat_session.model_dump()))
+
+    # Set a timeout for Redis data (1 hour)
     await redis_client.expire(str(token), 3600)
 
-    return chat_session.dict()
+    return chat_session.model_dump()
 
-# @route   POST /refresh_token
+# @route   GET /refresh_token
 # @desc    Route to refresh token
 # @access  Public
 @chat.get("/refresh_token")
 async def refresh_token(request: Request, token: str):
-    json_client = redis.create_rejson_connection()
-    cache = Cache(json_client)
-    data = await cache.get_chat_history(token)
+    redis_client = await redis.create_connection()
+    data = await redis_client.get(token)
 
-    if data == None:
+    if data is None:
         raise HTTPException(
             status_code=400, detail="Session expired or does not exist")
-    else:
-        return data
+    
+    # Parse the JSON data retrieved from Redis
+    data = json.loads(data)
+    return data
 
 # @route   Websocket /chat
 # @desc    Socket for chatbot
 # @access  Public
 @chat.websocket("/chat")
 async def websocket_endpoint(websocket: WebSocket, token: str = Depends(get_token)):
-    await manager.connect(websocket)
+    # Accept the WebSocket connection
+    await websocket.accept()
+    
     redis_client = await redis.create_connection()
     producer = Producer(redis_client)
     json_client = redis.create_rejson_connection()
@@ -70,29 +71,33 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Depends(get_toke
 
     try:
         while True:
+            # Receive message from WebSocket
             data = await websocket.receive_text()
-            stream_data = {}
-            stream_data[str(token)] = str(data)
+            stream_data = {str(token): str(data)}
             await producer.add_to_stream(stream_data, "message_channel")
+            
+            # Consume message from stream
             response = await consumer.consume_stream(stream_channel="response_channel", block=0)
-
             print(response)
+
             for stream, messages in response:
                 for message in messages:
-                    response_token = [k.decode('utf-8')
-                                      for k, v in message[1].items()][0]
-
+                    response_token = [k.decode('utf-8') for k, v in message[1].items()][0]
+                    
                     if token == response_token:
-                        response_message = [v.decode('utf-8')
-                                            for k, v in message[1].items()][0]
-
+                        response_message = [v.decode('utf-8') for k, v in message[1].items()][0]
                         print(message[0].decode('utf-8'))
                         print(token)
                         print(response_token)
 
-                        await manager.send_personal_message(response_message, websocket)
+                        await websocket.send_text(response_message)
 
                     await consumer.delete_message(stream_channel="response_channel", message_id=message[0].decode('utf-8'))
 
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        print("WebSocket disconnected")
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        await websocket.close()
+
+
